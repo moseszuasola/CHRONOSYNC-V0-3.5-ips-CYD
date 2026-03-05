@@ -1,0 +1,634 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPIFFS.h>
+#include <FS.h>
+#include <SD.h>
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <TJpg_Decoder.h> 
+#include <ArduinoJson.h>
+#include <vector>
+#include "web_index.h"
+
+// --- HARDWARE PINOUT (ESP32-3248S035 3.5" IPS CYD) ---
+// SD Card uses HSPI bus (separate from TFT)
+#define SD_CS    5
+#define SD_MOSI  23
+#define SD_MISO  19
+#define SD_SCK   18
+
+// Backlight pin for 3.5" CYD
+#define TFT_BL   27
+
+// --- OBJECTS ---
+TFT_eSPI tft = TFT_eSPI();
+WebServer server(80);
+SPIClass sdSPI(HSPI);
+File uploadFile;
+
+// --- GLOBAL STATE ---
+String ssid = ""; // [Inference] Loaded from config/wifi.json
+String password = ""; // [Inference] Loaded from config/wifi.json
+String currentFile = "";
+bool isSlideshow = true;
+bool sdReady = false;
+unsigned long lastSlideTime = 0;
+int slideInterval = 5000;
+std::vector<String> mediaFiles;
+int currentMediaIndex = 0;
+String currentOrientation = "landscape"; 
+long bootId = 0; 
+
+// --- VIDEO BUFFER ---
+// Larger buffer for smoother video playback (reduces "curtain" effect)
+// 480x320 screen = 153600 pixels * 2 bytes = 307200 bytes per frame
+// Using 32KB buffer for maximum speed on 3.5" display
+#define LINE_BUFFER_SIZE 32768
+uint8_t lineBuffer[LINE_BUFFER_SIZE];
+
+// --- PROTOTYPES ---
+void showSlideshow();
+void showSplashScreen();
+void drawSystemText(const char* text, int16_t x, int16_t y, uint16_t color, uint8_t font);
+bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap);
+void scanDirectory(const String &path, std::vector<String> &outFiles);
+void playRawVideo(String filename, bool infiniteLoop);
+void loadOrder(String orientation);
+void saveOrderConfig(String orientation, DynamicJsonDocument& doc);
+void loadWiFiConfig();
+void saveWiFiConfig(String s, String p);
+void setHardwareRotation(String orientation);
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.setTxPower(WIFI_POWER_11dBm); // Eco Mode
+  bootId = millis(); 
+
+  // --- 1. SD CARD INIT ---
+  // Note: SPI pins are shared with the TFT display
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  
+  // INCREASED SPEED: 16MHz for faster SD reads
+  if (SD.begin(SD_CS, sdSPI, 16000000)) {
+    sdReady = true;
+    SD.mkdir("/photos/landscape");
+    SD.mkdir("/photos/portrait");
+    SD.mkdir("/gifs/landscape");
+    SD.mkdir("/gifs/portrait");
+    SD.mkdir("/config");
+    loadWiFiConfig(); 
+  }
+
+  // --- 2. TFT DISPLAY INIT (3.5" IPS 480x320) ---
+  tft.begin();
+  
+  // Enable backlight FIRST (GPIO27 for 3.5" CYD)
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+  delay(100); // Let backlight stabilize
+  
+  setHardwareRotation(currentOrientation);
+  tft.fillScreen(TFT_BLACK);
+  
+  // Test: Draw colored rectangles to verify display is working
+  Serial.println("Drawing test rectangles (480x320)...");
+  tft.fillRect(0, 0, 50, 50, TFT_RED);
+  tft.fillRect(430, 0, 50, 50, TFT_GREEN);
+  tft.fillRect(0, 270, 50, 50, TFT_BLUE);
+  tft.fillRect(430, 270, 50, 50, TFT_YELLOW);
+  delay(1000);
+  
+  tft.fillScreen(TFT_BLACK);
+  
+  // CRITICAL: Initialize with swapBytes OFF for text
+  tft.setSwapBytes(false);
+  delay(50);
+  
+  Serial.println("TFT initialized, showing splash...");
+  
+  // --- SPLASH SCREEN ---
+  showSplashScreen();
+  unsigned long splashStart = millis();
+
+  // Init JPEG Decoder with callback
+  TJpgDec.setJpgScale(1);
+  TJpgDec.setSwapBytes(false);
+  TJpgDec.setCallback(tft_output);
+  
+  // --- 3. WIFI & WEB SERVER INIT ---
+  Serial.println("=====================================");
+  Serial.println("WiFi Connection Starting...");
+  Serial.print("SSID: ");
+  Serial.println(ssid);
+  Serial.print("Password length: ");
+  Serial.println(password.length());
+  Serial.println("=====================================");
+  
+  WiFi.disconnect(true);  // Clear any previous connection
+  delay(100);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  unsigned long start = millis();
+  
+  // Show WiFi connecting message on splash screen
+  tft.setSwapBytes(false); // Disable for text
+  drawSystemText("Connecting to WiFi...", 10, 205, TFT_YELLOW, 2);
+  
+  // Extended timeout for mobile hotspots (15 seconds)
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+    if (attempts % 10 == 0) {
+      Serial.println();
+      Serial.print("WiFi Status: ");
+      switch(WiFi.status()) {
+        case WL_IDLE_STATUS: Serial.println("IDLE"); break;
+        case WL_NO_SSID_AVAIL: Serial.println("NO SSID AVAILABLE - Check hotspot name!"); break;
+        case WL_SCAN_COMPLETED: Serial.println("SCAN COMPLETED"); break;
+        case WL_CONNECT_FAILED: Serial.println("CONNECT FAILED - Check password!"); break;
+        case WL_CONNECTION_LOST: Serial.println("CONNECTION LOST"); break;
+        case WL_DISCONNECTED: Serial.println("DISCONNECTED"); break;
+        default: Serial.println(WiFi.status()); break;
+      }
+    }
+  }
+  Serial.println();
+  
+  // Ensure splash screen shows for minimum 3 seconds
+  while(millis() - splashStart < 3000) {
+    delay(100);
+  }
+  
+  // Clear splash screen
+  tft.fillScreen(TFT_BLACK);
+  
+  if (WiFi.status() == WL_CONNECTED) {
+      String ipAddress = WiFi.localIP().toString();
+      Serial.println("=====================================");
+      Serial.println("WiFi Connected!");
+      Serial.print("IP Address: ");
+      Serial.println(ipAddress);
+      Serial.println("=====================================");
+      
+      drawSystemText("WiFi Connected", 5, 5, TFT_GREEN, 2);
+      drawSystemText(ipAddress.c_str(), 5, 25, TFT_GREEN, 2);
+      delay(2000);
+  } else {
+      Serial.println("=====================================");
+      Serial.println("WiFi Connection Failed!");
+      Serial.print("Final Status: ");
+      switch(WiFi.status()) {
+        case WL_NO_SSID_AVAIL: Serial.println("SSID not found - Is hotspot ON and visible?"); break;
+        case WL_CONNECT_FAILED: Serial.println("Wrong password!"); break;
+        default: Serial.print("Code: "); Serial.println(WiFi.status()); break;
+      }
+      Serial.println("=====================================");
+      
+      drawSystemText("WiFi FAILED", 5, 5, TFT_RED, 2);
+      drawSystemText("Check hotspot & password", 5, 25, TFT_YELLOW, 2);
+      delay(3000);
+  }
+  
+  // NOW set swapBytes for image rendering
+  tft.setSwapBytes(true);
+
+  // --- WEB SERVER ROUTING ---
+  server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", MAIN_page); });
+  
+  server.on("/api/status", HTTP_GET, []() {
+    String json = "{";
+    json += "\"slideshow\":" + String(isSlideshow ? "true" : "false") + ",";
+    json += "\"orientation\":\"" + currentOrientation + "\",";
+    json += "\"bootId\":" + String(bootId);
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/api/slideshow/start", HTTP_GET, []() {
+    isSlideshow = true;
+    loadOrder(currentOrientation); 
+    server.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/api/slideshow/stop", HTTP_GET, []() {
+    isSlideshow = false;
+    server.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/api/play", HTTP_GET, []() {
+    if (server.hasArg("file")) {
+      String f = server.arg("file");
+      if (SD.exists(f)) {
+        currentFile = f;
+        isSlideshow = false; 
+        
+        // Handle Orientation: Set before playing
+        if (f.indexOf("/portrait/") >= 0) tft.setRotation(0); else tft.setRotation(1);
+        
+        if (f.endsWith(".vid")) {
+           server.send(200, "application/json", "{\"ok\":true}");
+           // Playback happens in loop()
+        } else {
+           tft.fillScreen(TFT_BLACK);
+           tft.setSwapBytes(true);
+           TJpgDec.drawSdJpg(0, 0, currentFile);
+           server.send(200, "application/json", "{\"ok\":true}");
+        }
+      } else server.send(404, "application/json", "{\"error\":\"File not found\"}");
+    }
+  });
+
+  server.on("/api/photo/preview", HTTP_GET, []() {
+    if(server.hasArg("filename")) {
+        String f = server.arg("filename");
+        if(SD.exists(f)) {
+            File file = SD.open(f, "r");
+            server.streamFile(file, "image/jpeg");
+            file.close();
+        } else server.send(404, "text/plain", "Not Found");
+    }
+  });
+
+  server.on("/api/order", HTTP_POST, []() {
+    if(!server.hasArg("plain")) return server.send(400, "text/plain", "Body missing");
+    DynamicJsonDocument doc(4096);
+    deserializeJson(doc, server.arg("plain"));
+    String orient = doc["orientation"].as<String>();
+    saveOrderConfig(orient, doc); 
+    if(orient == currentOrientation) loadOrder(currentOrientation);
+    server.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/api/list", HTTP_GET, []() {
+    std::vector<String> allFiles;
+    scanDirectory("/photos/landscape", allFiles);
+    scanDirectory("/photos/portrait", allFiles);
+    scanDirectory("/gifs/landscape", allFiles);
+    scanDirectory("/gifs/portrait", allFiles);
+    String out = "{\"files\":[";
+    for(size_t i=0; i<allFiles.size(); i++) {
+      out += "\"" + allFiles[i] + "\"";
+      if(i < allFiles.size()-1) out += ",";
+    }
+    out += "]}";
+    server.send(200, "application/json", out);
+  });
+
+  server.on("/api/set", HTTP_GET, []() {
+    if (server.hasArg("orientation")) {
+      currentOrientation = server.arg("orientation");
+      setHardwareRotation(currentOrientation);
+      loadOrder(currentOrientation); 
+    }
+    if (server.hasArg("duration")) slideInterval = server.arg("duration").toInt() * 1000;
+    server.send(200, "application/json", "{\"ok\":true}");
+  });
+  
+  server.on("/api/clock/show", HTTP_GET, []() {
+    isSlideshow = false;
+    currentFile = "";
+    tft.fillScreen(TFT_BLACK);
+    tft.setSwapBytes(false); // Disable swap for text
+    
+    // Get current time
+    struct tm timeinfo;
+    if(getLocalTime(&timeinfo)){
+      char timeStr[10];
+      strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
+      
+      // Use simple print/setCursor approach (centered for 480x320)
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.setTextSize(5);
+      tft.setCursor(150, 100);
+      tft.print(timeStr);
+      
+      char dateStr[30];
+      strftime(dateStr, sizeof(dateStr), "%A, %B %d", &timeinfo);
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setCursor(100, 180);
+      tft.print(dateStr);
+    } else {
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.setTextSize(5);
+      tft.setCursor(170, 100);
+      tft.print("--:--");
+      
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setCursor(150, 180);
+      tft.print("No Time Sync");
+    }
+    
+    tft.setSwapBytes(true); // Re-enable for images
+    server.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/upload", HTTP_POST, []() { server.send(200, "text/plain", "OK"); }, []() {
+      HTTPUpload& upload = server.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+        isSlideshow = false; currentFile = ""; 
+        String filename = upload.filename;
+        if(filename.startsWith("/")) filename = filename.substring(1);
+        String targetOrient = server.arg("targetOrient");
+        if (targetOrient == "") targetOrient = "landscape";
+        
+        String lowerName = filename; lowerName.toLowerCase();
+        // Check if this is a GIF thumbnail (gifType parameter) or a .vid file
+        bool isGifRelated = lowerName.endsWith(".vid") || server.hasArg("gifType");
+        String folder = isGifRelated ? "/gifs/" + targetOrient : "/photos/" + targetOrient;
+        
+        if (!SD.exists(folder)) SD.mkdir(folder);
+        String path = folder + "/" + filename;
+        if(SD.exists(path)) SD.remove(path);
+        uploadFile = SD.open(path, FILE_WRITE);
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (uploadFile) uploadFile.write(upload.buf, upload.currentSize);
+      } else if (upload.status == UPLOAD_FILE_END) {
+        if (uploadFile) {
+            uploadFile.close();
+            loadOrder(currentOrientation); 
+        }
+      }
+  });
+  
+  server.on("/api/photo/delete", HTTP_POST, []() {
+      DynamicJsonDocument doc(512);
+      deserializeJson(doc, server.arg("plain"));
+      String f = doc["filename"];
+      if(SD.exists(f)) SD.remove(f);
+      loadOrder(currentOrientation); 
+      server.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/api/wifi", HTTP_POST, []() {
+     DynamicJsonDocument doc(512);
+     deserializeJson(doc, server.arg("plain"));
+     saveWiFiConfig(doc["ssid"], doc["pass"]);
+     server.send(200, "text/plain", "Rebooting");
+     delay(500);
+     ESP.restart();
+  });
+
+  server.begin();
+  loadOrder(currentOrientation);
+}
+
+void loop() {
+  server.handleClient();
+
+  // If a raw video file is set, play it continuously until stopped
+  if (!isSlideshow && currentFile.endsWith(".vid")) {
+      playRawVideo(currentFile, true); 
+  }
+  // If in slideshow mode, cycle through media
+  else if (isSlideshow) {
+      if (millis() - lastSlideTime > slideInterval) {
+          showSlideshow();
+          lastSlideTime = millis();
+      }
+  }
+}
+
+void loadWiFiConfig() {
+    if(SD.exists("/config/wifi.json")) {
+        File f = SD.open("/config/wifi.json");
+        DynamicJsonDocument doc(512);
+        deserializeJson(doc, f);
+        ssid = doc["ssid"].as<String>();
+        password = doc["pass"].as<String>();
+        f.close();
+    }
+}
+
+void saveWiFiConfig(String s, String p) {
+    File f = SD.open("/config/wifi.json", FILE_WRITE);
+    DynamicJsonDocument doc(512);
+    doc["ssid"] = s; doc["pass"] = p;
+    serializeJson(doc, f);
+    f.close();
+}
+
+void setHardwareRotation(String orientation) {
+    // The ST7796 is 320x480. Rotation 0 is portrait (320 wide), Rotation 1 is landscape (480 wide)
+    if (orientation == "portrait") tft.setRotation(0); 
+    else tft.setRotation(1); // Landscape
+}
+
+// --- HELPER FUNCTION: ROBUST TEXT RENDERING ---
+// MANDATORY: Use this function for ALL system text rendering
+// This ensures proper text display with correct datum and background clearing
+// NOTE: Caller MUST set tft.setSwapBytes(false) before calling this function
+void drawSystemText(const char* text, int16_t x, int16_t y, uint16_t color, uint8_t font) {
+    tft.setTextColor(color, TFT_BLACK); // CRITICAL: Background color required to overwrite pixels
+    tft.setTextSize(1);
+    tft.setCursor(x, y);
+    tft.print(text); // Use simple print with setCursor
+}
+
+// --- SPLASH SCREEN FUNCTION ---
+// Displays CHRONOSYNC branding centered on screen for 3 seconds
+void showSplashScreen() {
+    Serial.println("=== Splash Screen Start ===");
+    
+    // Ensure swapBytes is OFF for text rendering
+    tft.setSwapBytes(false);
+    tft.fillScreen(TFT_BLACK);
+    delay(100);
+    
+    Serial.println("Drawing title...");
+    // Use the most basic font (GLCD - font 1) with print instead of drawString
+    // Centered for 480x320 display
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setTextSize(3); // Larger for 3.5" display
+    tft.setCursor(120, 120);
+    tft.print("CHRONOSYNC");
+    
+    Serial.println("Drawing subtitle...");
+    // Subtitle
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(100, 170);
+    tft.print("Digital Memory Box");
+    
+    Serial.println("Drawing status...");
+    // Status message
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(180, 250);
+    tft.print("Initializing...");
+    
+    // Try drawing a simple test with basic font
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setCursor(10, 10);
+    tft.print("TEST");
+    
+    Serial.println("=== Splash Screen Complete ===");
+    
+    // Display for 3 seconds
+    delay(3000);
+}
+
+void loadOrder(String orientation) {
+    mediaFiles.clear();
+    std::vector<String> savedOrder;
+    String path = "/config/order_" + orientation + ".json";
+    
+    if(SD.exists(path)) {
+        File f = SD.open(path);
+        DynamicJsonDocument doc(4096);
+        deserializeJson(doc, f);
+        JsonArray arr = doc["files"];
+        // Only load files from /photos/ folder for slideshow
+        for(String s : arr) {
+            if(SD.exists(s) && s.indexOf("/photos/") >= 0) {
+                savedOrder.push_back(s);
+            }
+        }
+        f.close();
+    }
+
+    std::vector<String> diskFiles;
+    // ONLY scan photos folder for slideshow
+    scanDirectory("/photos/" + orientation, diskFiles);
+
+    for(String f : savedOrder) mediaFiles.push_back(f);
+    for(String f : diskFiles) {
+        bool alreadyIn = false;
+        for(String s : savedOrder) { if(s == f) { alreadyIn = true; break; } }
+        if(!alreadyIn) mediaFiles.push_back(f);
+    }
+    Serial.printf("Loaded %d files for %s\n", mediaFiles.size(), orientation.c_str());
+}
+
+void saveOrderConfig(String orientation, DynamicJsonDocument& doc) {
+    String path = "/config/order_" + orientation + ".json";
+    File f = SD.open(path, FILE_WRITE);
+    serializeJson(doc, f);
+    f.close();
+}
+
+// --- THE RAW VIDEO ENGINE (Optimized for Speed) ---
+void playRawVideo(String filename, bool infiniteLoop) {
+  File vFile = SD.open(filename);
+  if (!vFile || vFile.isDirectory()) { currentFile = ""; return; }
+
+  // 1. Calculate Frame and Line size based on current rotation
+  int screenWidth = tft.width(); // 320 or 480
+  int screenHeight = tft.height(); // 480 or 320
+  
+  // Bytes per frame: (Total Pixels) * 2 bytes/pixel (RGB565)
+  size_t bytesPerFrame = screenWidth * screenHeight * 2;
+  
+  // 2. Use swapBytes TRUE - the .vid file is RGB565 Little Endian from JavaScript
+  tft.setSwapBytes(true); 
+
+  // 3. TRANSACTION START: Optimize bus - keep SPI bus active
+  tft.startWrite();
+
+  bool keepPlaying = true;
+  unsigned long frameStart;
+  unsigned long lastWebCheck = 0;
+  const unsigned long WEB_CHECK_INTERVAL = 200; // Check web every 200ms instead of every frame
+  
+  // Target ~30 FPS for smooth animation (33ms per frame)
+  // But allow faster if SD card and display can keep up
+  const unsigned long TARGET_FRAME_TIME = 33;
+  
+  while (keepPlaying) {
+      frameStart = millis();
+      
+      if (vFile.available() < bytesPerFrame) {
+          if (infiniteLoop && !isSlideshow && currentFile == filename) {
+              vFile.seek(0); 
+          } else {
+              keepPlaying = false; 
+              break;
+          }
+      }
+      
+      // Set the write window for a full screen
+      tft.setAddrWindow(0, 0, screenWidth, screenHeight);
+
+      // Read and push frame in large chunks for maximum speed
+      size_t totalRead = 0;
+      while(totalRead < bytesPerFrame) {
+          size_t toRead = min((size_t)LINE_BUFFER_SIZE, bytesPerFrame - totalRead);
+          int bytesRead = vFile.read(lineBuffer, toRead);
+          
+          if (bytesRead <= 0) {
+              keepPlaying = false;
+              break; 
+          }
+          
+          // Push pixels directly
+          tft.pushColors((uint16_t*)lineBuffer, bytesRead / 2);
+          totalRead += bytesRead;
+      }
+      
+      // Only check web server periodically (not every frame) for better FPS
+      if (millis() - lastWebCheck > WEB_CHECK_INTERVAL) {
+          server.handleClient();
+          lastWebCheck = millis();
+          if (!isSlideshow && currentFile != filename) keepPlaying = false;
+      }
+      
+      // Minimal delay - only if frame was too fast (target 30 FPS)
+      unsigned long elapsed = millis() - frameStart;
+      if (elapsed < TARGET_FRAME_TIME) {
+          delay(TARGET_FRAME_TIME - elapsed);
+      }
+      // If frame took longer than target, no delay - run as fast as possible
+  }
+  
+  // 4. TRANSACTION END
+  tft.endWrite();
+  vFile.close();
+  
+  // 5. PHOTO MODE: Re-enable Byte Swapping for JPEGs
+  tft.setSwapBytes(true); 
+}
+
+bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+  if (y >= tft.height()) return 0;
+  tft.pushImage(x, y, w, h, bitmap);
+  return 1;
+}
+
+void scanDirectory(const String &path, std::vector<String> &outFiles) {
+  File root = SD.open(path);
+  if(!root || !root.isDirectory()) return;
+  File file = root.openNextFile();
+  while(file){
+    if(!file.isDirectory()) {
+        String n = String(file.name());
+        if (!n.startsWith("/")) n = path + "/" + n;
+        if(n.indexOf("._") == -1) outFiles.push_back(n);
+    }
+    file = root.openNextFile();
+  }
+}
+
+void showSlideshow() {
+  if (mediaFiles.empty()) return;
+  
+  currentMediaIndex = (currentMediaIndex + 1) % mediaFiles.size();
+  String f = mediaFiles[currentMediaIndex];
+  
+  // Set rotation based on the file's folder (portrait/landscape)
+  if(f.indexOf("/portrait/") >= 0) tft.setRotation(0); else tft.setRotation(1);
+  
+  if (f.endsWith(".vid")) {
+      currentFile = f; // Set current file so loop() takes over
+  } else if (f.endsWith(".jpg") || f.endsWith(".jpeg")) {
+      tft.fillScreen(TFT_BLACK);
+      tft.setSwapBytes(true);
+      TJpgDec.drawSdJpg(0, 0, f);
+  }
+}

@@ -1,0 +1,57 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "PlatformIO Build",
+			"type": "shell",
+			"command": "C:\\Users\\${env:USERNAME}\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run"
+			],
+			"problemMatcher": [
+				"$platformio"
+			],
+			"group": "build"
+		},
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "C:\\Users\\${env:USERNAME}\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run",
+				"--target",
+				"upload"
+			],
+			"problemMatcher": [
+				"$platformio"
+			],
+			"group": "build"
+		},
+		{
+			"label": "PlatformIO Upload MJPEG Fix",
+			"type": "shell",
+			"command": "cd '/Volumes/4tb Mac Hdd/Personal Projects/Chronosync/ChronoSync V0 - ESP32-035 3_5in IPS' && pio run -t upload",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "PlatformIO Upload Gallery Fix",
+			"type": "shell",
+			"command": "cd '/Volumes/4tb Mac Hdd/Personal Projects/Chronosync/ChronoSync V0 - ESP32-035 3_5in IPS' && pio run -t upload",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "PlatformIO Upload Optimized",
+			"type": "shell",
+			"command": "cd '/Volumes/4tb Mac Hdd/Personal Projects/Chronosync/ChronoSync V0 - ESP32-035 3_5in IPS' && ~/.platformio/penv/bin/platformio run -t upload",
+			"isBackground": false
+		},
+		{
+			"label": "PlatformIO Upload 80MHz SD",
+			"type": "shell",
+			"command": "cd '/Volumes/4tb Mac Hdd/Personal Projects/Chronosync/ChronoSync V0 - ESP32-035 3_5in IPS' && ~/.platformio/penv/bin/platformio run -t upload",
+			"isBackground": false
+		}
+	]
+}

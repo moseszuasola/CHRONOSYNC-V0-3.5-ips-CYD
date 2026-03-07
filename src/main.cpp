@@ -5,6 +5,7 @@
 #include "wifi_qr_data.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <FS.h>
 #include <Preferences.h>
@@ -54,6 +55,7 @@ unsigned long lastAPScreenUpdate = 0;
 
 TFT_eSPI tft = TFT_eSPI();
 WebServer server(80);
+DNSServer dnsServer;
 SPIClass sdSPI(HSPI);
 File uploadFile;
 Preferences preferences;
@@ -1510,6 +1512,22 @@ void setup() {
     }
   });
 
+  // Captive portal redirect endpoints
+  server.on("/generate_204", HTTP_GET, []() {
+    server.sendHeader("Location", "http://192.168.4.1/setup", true);
+    server.send(302, "text/plain", "");
+  });
+
+  server.on("/hotspot-detect.html", HTTP_GET, []() {
+    server.sendHeader("Location", "http://192.168.4.1/setup", true);
+    server.send(302, "text/plain", "");
+  });
+
+  server.on("/ncsi.txt", HTTP_GET, []() {
+    server.sendHeader("Location", "http://192.168.4.1/setup", true);
+    server.send(302, "text/plain", "");
+  });
+
   server.begin();
   server.enableCORS(true);
 
@@ -1614,6 +1632,8 @@ void loop() {
 
   // If in AP mode, only handle web server and keep showing setup screen
   if (isAPMode) {
+    dnsServer.processNextRequest(); // Process DNS requests for Captive Portal
+
     // Refresh AP setup screen every 30 seconds to keep it visible
     if (millis() - lastAPScreenUpdate > 30000) {
       showAPSetupScreen();
@@ -1797,6 +1817,9 @@ void startAPMode() {
 
   if (apStarted) {
     Serial.println("AP Started Successfully");
+    // Start DNS server for captive portal (port 53, redirect all to AP IP)
+    dnsServer.start(53, "*", WiFi.softAPIP());
+    Serial.println("DNS Server started for Captive Portal");
   } else {
     Serial.println("AP Start Failed");
   }

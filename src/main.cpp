@@ -4,6 +4,9 @@
 #include "web_index.h"
 #include "wifi_qr_data.h"
 #include <Arduino.h>
+#if __has_include("secrets.h")
+#include "secrets.h"
+#endif
 #include <ArduinoJson.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
@@ -15,6 +18,7 @@
 #include <TJpg_Decoder.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <ArduinoOTA.h>
 #include <esp_heap_caps.h>
 #include <esp_task_wdt.h>
 #include <freertos/FreeRTOS.h>
@@ -96,6 +100,7 @@ String timezoneName = "UTC+8 Manila";
 String barPosition = "top";
 String customMessages =
     "You're amazing!\\nKeep it up!\\nStay focused!\\nNever give up!";
+String clockTheme = "dark";
 
 String devicePIN = "1234";
 bool pinChangeRequired = false;
@@ -153,66 +158,8 @@ void showSplashScreen();
 void forceClockRedraw();
 void drawStatusBar();
 void drawStatusBar() {
-  if (!statusBarVisible || isShowingClock)
-    return;
-
-  static unsigned long lastStatusBarDraw = 0;
-  if (millis() - lastStatusBarDraw < 100)
-    return;
-  lastStatusBarDraw = millis();
-
-  int barHeight = 20;
-  int screenWidth = tft.width();
-  int screenHeight = tft.height();
-  int barY = (barPosition == "top") ? 0 : (screenHeight - barHeight);
-
-  tft.fillRect(0, barY, screenWidth, barHeight, TFT_BLACK);
-
-  String ipAddr = WiFi.localIP().toString();
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.setTextDatum(ML_DATUM);
-  tft.setTextSize(1);
-  tft.drawString(ipAddr, 5, barY + (barHeight / 2), 2);
-
-  // Calculate current message index based on time
-  // ✅ OPTIMIZATION: Cache parsed messages to avoid vector recreation every
-  // frame
-  static std::vector<String> cachedMsgs;
-  static String lastCustomMsgs = "";
-  String currentMessage = "";
-
-  if (!customMessages.isEmpty()) {
-    // Only re-parse if customMessages changed
-    if (customMessages != lastCustomMsgs) {
-      cachedMsgs.clear();
-      String temp = customMessages;
-      temp.replace("\\\\n", "\n");
-      int start = 0;
-      while (start < (int)temp.length()) {
-        int end = temp.indexOf('\n', start);
-        if (end == -1)
-          end = temp.length();
-        String line = temp.substring(start, end);
-        line.trim();
-        if (line.length() > 0 && line.length() <= 20) {
-          cachedMsgs.push_back(line);
-        }
-        start = end + 1;
-      }
-      lastCustomMsgs = customMessages;
-    }
-    if (!cachedMsgs.empty()) {
-      currentMessage = cachedMsgs[(millis() / 5000) % cachedMsgs.size()];
-    }
-  }
-  if (currentMessage.isEmpty()) {
-    currentMessage = encouragementMessages[(millis() / 5000) % messageCount];
-  }
-
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.setTextDatum(MR_DATUM);
-  tft.drawString(currentMessage.substring(0, 20), screenWidth - 5,
-                 barY + (barHeight / 2), 2);
+  // Status bar removed per UX revision - no overlay bar on photos or clock
+  return;
 }
 
 void showClock();
@@ -253,21 +200,16 @@ void drawMontDigitGlyph(int16_t x, int16_t y, char ch,
       uint16_t v = pgm_read_word(
           &MontserratBoldClock56Bitmaps[offset + srcRow * w + srcCol]);
 
-      if (v == 0x0000) {
-        rowBuf[col] = bgColor;
-      } else {
-        uint8_t r = (v >> 11) & 0x1F;
-        uint8_t g = (v >> 5) & 0x3F;
-        uint8_t b = v & 0x1F;
-
-        r = 31 - r;
-        g = 63 - g;
-        b = 31 - b;
-
-        rowBuf[col] = (r << 11) | (g << 5) | b;
-      }
+      // v == 0x0000 is background (transparent), any other value is foreground
+      rowBuf[col] = (v == 0x0000) ? bgColor : fgColor;
     }
     tft.pushImage(x, y + row, scaledW, 1, rowBuf);
+    
+    // Feed WDT & Yield every 8 rows during heavy upscaling rendering (e.g. 2.8x scale)
+    if (row % 8 == 0) {
+        esp_task_wdt_reset();
+        yield();
+    }
   }
 }
 
@@ -289,6 +231,22 @@ void drawMontDigitString(int16_t x, int16_t y, const char *s,
     drawMontDigitGlyph(curX, y + yOffset, *p, fgColor, bgColor, scale);
     curX += (int)(w * scale) + (int)(spacing * scale);
   }
+}
+
+int16_t getMontStringWidth(const char *s, uint8_t spacing = 4, float scale = 1.0) {
+  int16_t totalW = 0;
+  for (const char *p = s; *p; ++p) {
+    const char *found = strchr(MontserratBoldClock56Chars, *p);
+    if (!found) {
+      totalW += (int)(spacing * scale);
+      continue;
+    }
+    int idx = found - MontserratBoldClock56Chars;
+    uint8_t w = pgm_read_byte(&MontserratBoldClock56Width[idx]);
+    totalW += (int)(w * scale) + (int)(spacing * scale);
+  }
+  if (totalW > 0) totalW -= (int)(spacing * scale);
+  return totalW;
 }
 
 // Draw AM/PM string using smaller font
@@ -324,17 +282,8 @@ void drawAMPMString(int16_t x, int16_t y, const char *s, uint8_t spacing = 2,
         uint16_t v = pgm_read_word(
             &MontserratBoldAMPMBitmaps[offset + srcRow * w + srcCol]);
 
-        if (v == 0x0000) {
-          rowBuf[col] = bgColor;
-        } else {
-          uint8_t r = (v >> 11) & 0x1F;
-          uint8_t g = (v >> 5) & 0x3F;
-          uint8_t b = v & 0x1F;
-          r = 31 - r;
-          g = 63 - g;
-          b = 31 - b;
-          rowBuf[col] = (r << 11) | (g << 5) | b;
-        }
+        // v == 0x0000 is background, anything else is foreground
+        rowBuf[col] = (v == 0x0000) ? bgColor : fgColor;
       }
       tft.pushImage(curX, y + row, scaledW, 1, rowBuf);
     }
@@ -527,67 +476,32 @@ void setup() {
       server.sendHeader("Location", "/setup", true);
       server.send(302, "text/plain", "");
     } else {
-      // Send HTML page in chunks to prevent watchdog timeout
-      size_t pageLen = strlen_P(MAIN_page);
-      server.setContentLength(pageLen);
+      // Proper chunked transfer for Gzipped page - required for browser compatibility
+      server.sendHeader("Content-Encoding", "gzip");
+      server.sendHeader("Cache-Control", "no-cache");
+      server.setContentLength(CONTENT_LENGTH_UNKNOWN); // Enable chunked transfer
       server.send(200, "text/html", "");
 
-      const size_t chunkSize = 4096; // 4KB chunks
+      const size_t chunkSize = 2048; // Smaller chunks for reliability
       size_t sent = 0;
-      char buffer[chunkSize + 1];
+      uint8_t buffer[chunkSize];
 
-      while (sent < pageLen) {
-        size_t toSend = min(chunkSize, pageLen - sent);
+      while (sent < MAIN_page_len) {
+        uint32_t toSend = min((uint32_t)chunkSize, (uint32_t)(MAIN_page_len - sent));
         memcpy_P(buffer, MAIN_page + sent, toSend);
-        buffer[toSend] = '\0';
-        server.sendContent(buffer, toSend);
+        server.sendContent((const char *)buffer, toSend);
         sent += toSend;
-
-        // Feed watchdog every chunk
         esp_task_wdt_reset();
-        yield(); // Allow system tasks
+        yield();
       }
+      server.sendContent(""); // Terminate chunked transfer
     }
   });
 
+  // Auth endpoints removed - access is via IP address only (no PIN required)
   server.on("/api/auth", HTTP_POST, []() {
-    if (server.hasArg("pin")) {
-      String inputPIN = server.arg("pin");
-      if (inputPIN == devicePIN) {
-        isAuthenticated = true;
-        time(
-            &authTimestamp); // Record authentication time using real epoch time
-        saveAuthState();     // Persist authentication state
-        server.send(200, "application/json",
-                    "{\"success\":true,\"requireChange\":" +
-                        String(pinChangeRequired ? "true" : "false") + "}");
-      } else {
-        server.send(200, "application/json", "{\"success\":false}");
-      }
-    } else {
-      server.send(400, "text/plain", "Missing PIN");
-    }
-  });
-
-  server.on("/api/changepin", HTTP_POST, []() {
-    if (!checkAuth()) {
-      server.send(403, "text/plain", "Unauthorized");
-      return;
-    }
-    if (server.hasArg("oldPin") && server.hasArg("newPin")) {
-      String oldPin = server.arg("oldPin");
-      String newPin = server.arg("newPin");
-      if (oldPin == devicePIN && newPin.length() >= 4) {
-        devicePIN = newPin;
-        pinChangeRequired = false;
-        savePIN();
-        server.send(200, "application/json", "{\"success\":true}");
-      } else {
-        server.send(200, "application/json", "{\"success\":false}");
-      }
-    } else {
-      server.send(400, "text/plain", "Missing parameters");
-    }
+    server.send(200, "application/json",
+                "{\"success\":true,\"requireChange\":false}");
   });
 
   server.on("/api/status", HTTP_GET, []() {
@@ -1098,7 +1012,7 @@ void setup() {
       return;
     }
     if (server.hasArg("plain")) {
-      DynamicJsonDocument doc(512);
+      DynamicJsonDocument doc(2048); // expanded from 512 to handle large payloads
       deserializeJson(doc, server.arg("plain"));
 
       bool wasClockOnlyMode = clockOnlyScreen; // Track previous state
@@ -1121,6 +1035,11 @@ void setup() {
       }
       if (doc.containsKey("clockOnlyScreen")) {
         clockOnlyScreen = doc["clockOnlyScreen"].as<bool>();
+        if (clockOnlyScreen) {
+          isSlideshow = false;
+          isClockOnlyMode = true;
+          isShowingClock = true;
+        }
       }
       if (doc.containsKey("clockEnabled")) {
         clockEnabled = doc["clockEnabled"].as<bool>();
@@ -1134,12 +1053,35 @@ void setup() {
       if (doc.containsKey("customMessages")) {
         customMessages = doc["customMessages"].as<String>();
       }
+      
+      bool themeChanged = false;
+      if (doc.containsKey("clockTheme")) {
+        String newTheme = doc["clockTheme"].as<String>();
+        if (newTheme != "dark" && newTheme != "light")
+          newTheme = "dark";
+        if (clockTheme != newTheme) {
+            clockTheme = newTheme;
+            themeChanged = true;
+        }
+      }
 
       // Save to config file
       saveWiFiConfig(ssid, password);
 
       // Save device state since clockOnlyScreen may have changed
       saveDeviceState();
+
+      // Force immediate screen update on ANY clock state change
+      if (doc.containsKey("clockOnlyScreen") || themeChanged) {
+        if (clockOnlyScreen) {
+          isShowingClock = true;
+          isSlideshow = false;
+          isClockOnlyMode = true;
+          forceClockRedraw();
+        } else if (themeChanged && isShowingClock) {
+          forceClockRedraw();
+        }
+      }
 
       // Reconfigure NTP with new timezone
       configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
@@ -1183,21 +1125,22 @@ void setup() {
       server.send(403, "text/plain", "Unauthorized");
       return;
     }
-    String json = "{";
-    json += "\"use24Hour\":" + String(use24Hour ? "true" : "false") + ",";
-    json += "\"timezoneOffset\":" + String(gmtOffset_sec) + ",";
-    json += "\"timezoneName\":\"" + timezoneName + "\",";
-    json += "\"clockDisplayDuration\":" + String(clockDisplayDuration) + ",";
-    json += "\"clockPhotoInterval\":" + String(clockPhotoInterval) + ",";
-    json +=
-        "\"clockOnlyScreen\":" + String(clockOnlyScreen ? "true" : "false") +
-        ",";
-    json += "\"clockEnabled\":" + String(clockEnabled ? "true" : "false") + ",";
-    json +=
-        "\"clockShowAtEnd\":" + String(clockShowAtEnd ? "true" : "false") + ",";
-    json += "\"barPosition\":\"" + barPosition + "\",";
-    json += "\"customMessages\":\"" + customMessages + "\"";
-    json += "}";
+    
+    DynamicJsonDocument doc(2048);
+    doc["use24Hour"] = use24Hour;
+    doc["timezoneOffset"] = gmtOffset_sec;
+    doc["timezoneName"] = timezoneName;
+    doc["clockDisplayDuration"] = clockDisplayDuration;
+    doc["clockPhotoInterval"] = clockPhotoInterval;
+    doc["clockOnlyScreen"] = clockOnlyScreen;
+    doc["clockEnabled"] = clockEnabled;
+    doc["clockShowAtEnd"] = clockShowAtEnd;
+    doc["barPosition"] = barPosition;
+    doc["customMessages"] = customMessages;
+    doc["clockTheme"] = clockTheme;
+    
+    String json;
+    serializeJson(doc, json);
     server.send(200, "application/json", json);
   });
 
@@ -1391,6 +1334,11 @@ void setup() {
             "</body></html>");
   });
 
+  // Add favicon.ico 204 handler to prevent browser stalls
+  server.on("/favicon.ico", HTTP_GET, []() {
+    server.send(204, "text/plain", ""); // No content, prevents 404 stalls
+  });
+
   // Networks list page
   server.on("/networks", HTTP_GET, []() {
     String networks = scanWiFiNetworks();
@@ -1488,41 +1436,6 @@ void setup() {
     }
   });
 
-  // Captive portal redirect
-  server.on("/generate_204", HTTP_GET, []() {
-    server.sendHeader("Location", "http://192.168.4.1/setup", true);
-    server.send(302, "text/plain", "");
-  });
-
-  server.on("/hotspot-detect.html", HTTP_GET, []() {
-    server.sendHeader("Location", "http://192.168.4.1/setup", true);
-    server.send(302, "text/plain", "");
-  });
-
-  server.on("/connecttest.txt", HTTP_GET,
-            []() { server.send(200, "text/plain", "Microsoft NCSI"); });
-
-  // Catch-all for captive portal
-  server.onNotFound([]() {
-    if (isAPMode) {
-      server.sendHeader("Location", "http://192.168.4.1/setup", true);
-      server.send(302, "text/plain", "");
-    } else {
-      server.send(404, "text/plain", "Not found");
-    }
-  });
-
-  // Captive portal redirect endpoints
-  server.on("/generate_204", HTTP_GET, []() {
-    server.sendHeader("Location", "http://192.168.4.1/setup", true);
-    server.send(302, "text/plain", "");
-  });
-
-  server.on("/hotspot-detect.html", HTTP_GET, []() {
-    server.sendHeader("Location", "http://192.168.4.1/setup", true);
-    server.send(302, "text/plain", "");
-  });
-
   server.on("/ncsi.txt", HTTP_GET, []() {
     server.sendHeader("Location", "http://192.168.4.1/setup", true);
     server.send(302, "text/plain", "");
@@ -1532,15 +1445,18 @@ void setup() {
   server.enableCORS(true);
 
   // === START mDNS for easy discovery (works across 5GHz/2.4GHz isolation) ===
-  if (!isAPMode && MDNS.begin("chronosync")) {
-    MDNS.addService("http", "tcp", 80);
-    Serial.println("mDNS responder started!");
-    Serial.println("Access device at: http://chronosync.local");
-    Serial.printf("Or via IP: http://%s\n", WiFi.localIP().toString().c_str());
-  } else if (!isAPMode) {
-    Serial.println("mDNS failed to start");
-    Serial.printf("Access device via IP: http://%s\n",
-                  WiFi.localIP().toString().c_str());
+  if (!isAPMode) {
+    if (MDNS.begin("chronosync")) {
+      MDNS.addService("http", "tcp", 80);
+      Serial.println("mDNS responder started!");
+      Serial.println("Access device at: http://chronosync.local");
+      Serial.printf("Or via IP: http://%s\n", WiFi.localIP().toString().c_str());
+    } else {
+      Serial.println("mDNS failed to start");
+      Serial.printf("Access device via IP: http://%s\n", WiFi.localIP().toString().c_str());
+    }
+    // Optimization for 5G modems: Disable sleep for lower latency
+    WiFi.setSleep(false);
   }
 
   loadOrder(currentOrientation);
@@ -1617,18 +1533,39 @@ void loop() {
     lastMaintenanceCheck = millis();
   }
 
-  // Check WiFi connection and reconnect if needed (every 30 seconds)
-  static unsigned long lastWiFiCheck = 0;
-  if (!isAPMode && (millis() - lastWiFiCheck > 30000)) {
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi disconnected, attempting reconnect...");
-      WiFi.reconnect();
-    }
-    lastWiFiCheck = millis();
-  }
-
   // Handle touch input (all gestures)
   handleTouch();
+
+  // === EMERGENCY RECOVERY: 5s BOOT Button Hold ===
+  static unsigned long bootPressStart = 0;
+  if (digitalRead(BOOT_BUTTON) == LOW) {
+    if (bootPressStart == 0) {
+      bootPressStart = millis();
+    } else if (millis() - bootPressStart > 5000) {
+      Serial.println("[EMERGENCY] 5s BOOT Hold - Manual Safe Reset triggered");
+      bootPressStart = 0;
+
+      // Forced Safe State
+      currentOrientation = "landscape";
+      isSlideshow = true;
+      isShowingClock = false;
+      isClockOnlyMode = false;
+      clockOnlyScreen = false;
+      currentFile = "";
+      tft.setRotation(1);
+      
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+      tft.setTextDatum(MC_DATUM);
+      tft.drawString("SYSTEM RESET - OK", 240, 160, 4);
+      delay(2000);
+      
+      saveDeviceState();
+      ESP.restart();
+    }
+  } else {
+    bootPressStart = 0;
+  }
 
   // If in AP mode, only handle web server and keep showing setup screen
   if (isAPMode) {
@@ -1831,45 +1768,50 @@ void startAPMode() {
 }
 
 void showAPSetupScreen() {
-  // Clear screen with gradient background
   tft.fillScreen(TFT_BLACK);
   tft.setSwapBytes(false);
 
-  // Draw header section with border
-  tft.fillRect(0, 0, 480, 50, TFT_NAVY);
-  tft.drawRect(0, 0, 480, 50, TFT_CYAN);
-  drawSystemText("WiFi Setup Required", 100, 15, TFT_YELLOW, 3);
+  // Clean header
+  tft.fillRect(0, 0, 480, 55, 0x0020); // very dark blue
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, 0x0020);
+  tft.setTextSize(1);
+  tft.drawString("ChronoSync - WiFi Setup", 240, 14, 4);
+  tft.setTextColor(TFT_CYAN, 0x0020);
+  tft.drawString("Connect to configure your device", 240, 38, 2);
 
-  // Left column - Instructions
-  tft.drawRect(10, 60, 220, 200, TFT_DARKGREY);
-  tft.fillRect(11, 61, 218, 198, TFT_BLACK);
+  // Left panel - Network info
+  int panelY = 70;
+  tft.setTextDatum(ML_DATUM);
 
-  drawSystemText("1. Connect to Network:", 20, 75, TFT_WHITE, 2);
-  drawSystemText(apSSID, 25, 95, TFT_CYAN, 2);
-  drawSystemText("(Open - No Password)", 25, 115, TFT_GREEN, 1);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString("STEP 1: Join WiFi Network", 20, panelY, 2);
 
-  drawSystemText("2. Open Browser:", 20, 140, TFT_WHITE, 2);
-  drawSystemText("192.168.4.1", 25, 160, TFT_GREEN, 2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Network:", 20, panelY + 22, 2);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString(apSSID, 100, panelY + 22, 2);
 
-  drawSystemText("3. Configure WiFi", 20, 185, TFT_WHITE, 2);
-  drawSystemText("4. Device will restart", 20, 205, TFT_WHITE, 2);
-  drawSystemText("   when connected", 20, 225, TFT_WHITE, 2);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawString("No password required", 20, panelY + 42, 2);
 
-  // Right column - QR Code section (white background for better scanning)
-  tft.drawRect(250, 60, 220, 200, TFT_DARKGREY);
-  tft.fillRect(251, 61, 218, 198, TFT_WHITE);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString("STEP 2: Open Browser", 20, panelY + 72, 2);
 
-  drawSystemText("Scan QR Code:", 260, 75, TFT_BLACK, 2);
-  drawSystemText("Quick Connect", 280, 95, TFT_BLUE, 1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Address:", 20, panelY + 94, 2);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("192.168.4.1", 100, panelY + 94, 4);
 
-  // Draw real QR code (black on white)
-  drawWiFiQRCode(285, 105);
+  // Right panel - QR Code in a white box for scanning
+  int qrX = 280, qrY = 80;
+  int qrBoxSize = 190;
+  tft.fillRect(qrX - 5, qrY - 5, qrBoxSize, qrBoxSize, TFT_WHITE);
+  drawWiFiQRCode(qrX + 2, qrY + 2);
 
-  // Status bar at bottom
-  tft.fillRect(0, 270, 480, 50, TFT_DARKGREEN);
-  tft.drawRect(0, 270, 480, 50, TFT_GREEN);
-  drawSystemText("Status: Waiting for WiFi Configuration...", 20, 290,
-                 TFT_WHITE, 2);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("or scan to connect", 375, qrY + qrBoxSize + 5, 2);
 
   tft.setSwapBytes(true);
 }
@@ -1980,6 +1922,13 @@ bool scanAndConnectToWiFi(String newSSID, String newPassword) {
     drawSystemText("Starting device...", 10, 180, TFT_CYAN, 2);
     tft.setSwapBytes(true);
 
+    // Re-initialize mDNS on new connection
+    if (MDNS.begin("chronosync")) {
+        MDNS.addService("http", "tcp", 80);
+        Serial.println("mDNS responder re-started!");
+    }
+    WiFi.setSleep(false); // Ensure low latency
+
     delay(3000);
     return true;
   } else {
@@ -2036,26 +1985,29 @@ void loadWiFiConfig() {
   // Load other settings from SD card if available
   if (SD.exists("/config/wifi.json")) {
     File f = SD.open("/config/wifi.json");
-    DynamicJsonDocument doc(512);
+    DynamicJsonDocument doc(2048);
     deserializeJson(doc, f);
 
     // Load clock settings (these can stay on SD card)
     use24Hour = doc["use24Hour"] | false;
     gmtOffset_sec = doc["gmtOffset"] | (8 * 3600);
     timezoneName = doc["timezoneName"] | "UTC+8 Manila";
-    clockDisplayDuration =
-        doc["clockDisplayDuration"] | 30; // Default 30 seconds
-    clockPhotoInterval =
-        doc["clockPhotoInterval"] | 0; // Default 0 = show at end of slideshow
-    clockOnlyScreen = doc["clockOnlyScreen"] | false; // Default off
+    clockDisplayDuration = doc["clockDisplayDuration"] | 30;
+    clockPhotoInterval = doc["clockPhotoInterval"] | 0;
+    clockOnlyScreen = doc["clockOnlyScreen"] | false;
     clockEnabled = doc["clockEnabled"] | true;        // Default on
     clockShowAtEnd =
         doc["clockShowAtEnd"] | true; // Default on (show at end of slideshow)
-    barPosition = doc["barPosition"] | "top"; // Default top
-    customMessages =
-        doc["customMessages"] |
-        "Creating memories...\\nLife is beautiful!\\nEnjoy the "
-        "moments!\\nYou're amazing!\\nNever give up!"; // Default messages
+    clockTheme = doc["clockTheme"] | "dark";
+    barPosition = doc["barPosition"] | "top";
+    customMessages = doc["customMessages"] | "Creating memories...\\nLife is beautiful!\\nEnjoy the moments!\\nYou're amazing!\\nNever give up!";
+
+    // Sync state flags if clock only mode is active
+    if (clockOnlyScreen) {
+        isClockOnlyMode = true;
+        isSlideshow = false;
+        isShowingClock = true;
+    }
 
     f.close();
   }
@@ -2074,7 +2026,7 @@ void saveWiFiConfig(String s, String p) {
   if (sdReady) {
     File f = SD.open("/config/wifi.json", FILE_WRITE);
     if (f) {
-      DynamicJsonDocument doc(512);
+      DynamicJsonDocument doc(2048);
       doc["ssid"] = s;
       doc["pass"] = p;
       doc["use24Hour"] = use24Hour;
@@ -2087,6 +2039,7 @@ void saveWiFiConfig(String s, String p) {
       doc["clockShowAtEnd"] = clockShowAtEnd;
       doc["barPosition"] = barPosition;
       doc["customMessages"] = customMessages;
+      doc["clockTheme"] = clockTheme;
       serializeJson(doc, f);
       f.close();
       Serial.println("WiFi config also backed up to SD card");
@@ -2117,6 +2070,7 @@ void saveDeviceState() {
   preferences.putString("currFile", currentFile);
   preferences.putInt("mediaIdx", currentMediaIndex);
   preferences.putString("orientation", currentOrientation);
+  preferences.putString("clockTheme", clockTheme);
 
   preferences.end();
 
@@ -2135,16 +2089,15 @@ void loadDeviceState() {
   currentFile = preferences.getString("currFile", "");
   currentMediaIndex = preferences.getInt("mediaIdx", 0);
   currentOrientation = preferences.getString("orientation", "landscape");
+  clockTheme = preferences.getString("clockTheme", "dark");
 
   preferences.end();
 
-  // === SANITY CHECK: Fix contradictory or stale saved states ===
-  // If clockOnlyScreen is on but slideshow is also on — contradictory, clear it
-  if (clockOnlyScreen && isSlideshow) {
-    Serial.println("[STATE] Contradictory state detected "
-                   "(clockOnlyScreen+isSlideshow) — resetting clockOnlyScreen");
-    clockOnlyScreen = false;
-    isClockOnlyMode = false;
+  // If clockOnlyScreen is on, ensure display flags are synced
+  if (clockOnlyScreen) {
+    isSlideshow = false;
+    isClockOnlyMode = true;
+    isShowingClock = true;
   }
   // If saved file no longer exists on SD, fall back to slideshow
   if (currentFile.length() > 0 && sdReady && !SD.exists(currentFile)) {
@@ -2274,41 +2227,8 @@ void loadAuthState() {
   }
 }
 
-// Check if authentication session is still valid (3-day expiry)
-bool checkAuth() {
-  if (!isAuthenticated) {
-    Serial.println("[AUTH] Not authenticated");
-    return false;
-  }
-
-  // Check if we have valid time (NTP synced)
-  time_t currentTime;
-  time(&currentTime);
-
-  // If time is not synced (before year 2020), skip expiry check but allow
-  // access
-  if (currentTime < 1577836800) { // Jan 1, 2020
-    Serial.println(
-        "[AUTH] Time not synced - allowing access (auth state exists)");
-    return true;
-  }
-
-  // Check if session expired (3 days)
-  time_t elapsed = currentTime - authTimestamp;
-
-  Serial.printf("[AUTH] Session age: %ld seconds (max: %ld)", elapsed,
-                AUTH_EXPIRY);
-
-  if (elapsed > AUTH_EXPIRY || elapsed < 0) {
-    Serial.println(" - EXPIRED");
-    isAuthenticated = false; // Session expired
-    saveAuthState();         // Clear saved auth state
-    return false;
-  }
-
-  Serial.println(" - Valid");
-  return true;
-}
+// Auth removed - any user who knows the IP address has access
+bool checkAuth() { return true; }
 
 bool readTouch(uint16_t *x, uint16_t *y) {
   static unsigned long lastPrint = 0;
@@ -2582,280 +2502,90 @@ void handleTouch() {
   uint16_t x, y;
   bool touching = readTouch(&x, &y);
 
-  // Track last valid touch coordinates
-  static uint16_t lastTouchX = 0, lastTouchY = 0;
-  if (touching) {
-    lastTouchX = x;
-    lastTouchY = y;
-  }
+  // === SIMPLIFIED TOUCH: Only 5-second long press to show IP ===
+  static bool ipDisplayActive = false;
+  static unsigned long ipDisplayStart = 0;
 
-  // Touch started
-  if (touching && !isTouching) {
-    Serial.printf(">>> TOUCH STARTED at (%d, %d)\n", x, y);
-    isTouching = true;
-    touchStartTime = millis();
-    touchStartX = x;
-    touchStartY = y;
-    longPressHandled = false;
-  }
+  // If IP is currently showing, wait for 20s then restore
+  if (ipDisplayActive) {
+    if (millis() - ipDisplayStart >= 20000) {
+      Serial.println("[TOUCH] IP display timeout - restoring screen");
+      ipDisplayActive = false;
 
-  // Touch released
-  else if (!touching && isTouching) {
-    isTouching = false;
-    unsigned long touchDuration = millis() - touchStartTime;
-
-    // Use last valid coordinates for release position
-    // Coordinates are already mapped to screen space correctly for both
-    // orientations
-    int deltaX = lastTouchX - touchStartX;
-    int deltaY = lastTouchY - touchStartY;
-
-    Serial.printf(
-        ">>> TOUCH RELEASED at (%d, %d) - Duration: %lums, Delta: (%d, %d)\n",
-        lastTouchX, lastTouchY, touchDuration, deltaX, deltaY);
-
-    // Ignore if long press was already handled
-    if (longPressHandled) {
-      Serial.println(">>> Long press already handled - ignoring");
-      delay(DEBOUNCE_TIME);
-      return;
-    }
-
-    // SPECIAL MODE: WiFi QR showing - any tap closes it
-    if (showingWiFiQR) {
-      Serial.println(">>> Closing WiFi QR");
-      hideWiFiQROverlay();
-      delay(DEBOUNCE_TIME);
-      return;
-    }
-
-    // SPECIAL MODE: GIF Preview Mode
-    if (gifPreviewMode) {
-      Serial.printf(">>> In GIF preview mode - checking gesture at (%d, %d)\n",
-                    lastTouchX, lastTouchY);
-
-      int screenWidth = tft.width();
-      int screenHeight = tft.height();
-      int cornerZone = screenWidth / 5;      // Left/right 20% zones
-      int topZone = screenHeight / 4;        // Top 25% zone
-      int bottomZone = screenHeight * 3 / 4; // Bottom 25% zone starts here
-
-      // Swipe detection
-      if (abs(deltaX) > TOUCH_THRESHOLD) {
-        Serial.printf(">>> SWIPE detected: deltaX=%d\n", deltaX);
-        if (deltaX > 0) {
-          navigateGifPreview(-1); // Swipe right = previous
-        } else {
-          navigateGifPreview(1); // Swipe left = next
-        }
-      }
-      // Center tap = select and play GIF
-      else if (lastTouchX > cornerZone &&
-               lastTouchX < (screenWidth - cornerZone) &&
-               lastTouchY > topZone && lastTouchY < bottomZone) {
-        Serial.printf(">>> CENTER TAP detected - playing GIF %d\n",
-                      currentGifPreviewIndex);
-        if (currentGifPreviewIndex < (int)gifFiles.size()) {
-          String selectedCover = gifFiles[currentGifPreviewIndex];
-
-          // Find corresponding video file by replacing .jpg/.jpeg with .vid or
-          // .mjpeg
-          String baseFile = selectedCover;
-          if (baseFile.endsWith(".jpg")) {
-            baseFile = baseFile.substring(0, baseFile.length() - 4);
-          } else if (baseFile.endsWith(".jpeg")) {
-            baseFile = baseFile.substring(0, baseFile.length() - 5);
-          }
-
-          // Check for .mjpeg first, then .vid
-          String videoFile = baseFile + ".mjpeg";
-          if (!SD.exists(videoFile)) {
-            videoFile = baseFile + ".vid";
-          }
-
-          // Check if video file exists
-          if (SD.exists(videoFile)) {
-            Serial.printf(">>> Playing GIF animation: %s\n", videoFile.c_str());
-            currentFile = videoFile;
-            isSlideshow = false;
-            isShowingClock = false;
-            exitGifPreviewMode();
-            tft.fillScreen(TFT_BLACK);
-            saveDeviceState();
-            // GIF animation will play in main loop
-          } else {
-            Serial.println(">>> No video file found, showing static image");
-            currentFile = selectedCover;
-            isSlideshow = false;
-            isShowingClock = false;
-            exitGifPreviewMode();
+      // Restore screen to previous state
+      if (isShowingClock || isClockOnlyMode || clockOnlyScreen) {
+        forceClockRedraw();
+      } else if (!mediaFiles.empty()) {
+        // Redraw current media
+        if (!currentFile.isEmpty()) {
+          if (currentFile.endsWith(".jpg") || currentFile.endsWith(".jpeg")) {
             tft.fillScreen(TFT_BLACK);
             tft.setSwapBytes(true);
             TJpgDec.drawSdJpg(0, 0, currentFile);
-            saveDeviceState();
           }
-        }
-      }
-      // Corner tap = exit to slideshow
-      else if ((lastTouchX < cornerZone ||
-                lastTouchX > (screenWidth - cornerZone)) ||
-               (lastTouchY < topZone || lastTouchY > bottomZone)) {
-        Serial.println(">>> CORNER TAP detected - exiting to slideshow");
-        exitGifPreviewMode();
-
-        // Reload photos in current orientation before starting slideshow
-        loadOrder(currentOrientation);
-
-        if (!mediaFiles.empty()) {
-          isSlideshow = true;
-          isShowingClock = false;
-          lastSlideTime = millis() - slideInterval;
-          saveDeviceState();
+        } else {
+          tft.fillScreen(TFT_BLACK);
         }
       } else {
-        Serial.printf(">>> No gesture matched - x=%d, y=%d, deltaX=%d\n",
-                      lastTouchX, lastTouchY, deltaX);
-      }
-
-      delay(DEBOUNCE_TIME);
-      return;
-    }
-
-    // NORMAL MODE: Detect gestures
-
-    // Swipe detection (left/right navigation)
-    if (abs(deltaX) > TOUCH_THRESHOLD && abs(deltaY) < TOUCH_THRESHOLD) {
-      if (!mediaFiles.empty()) {
-        if (deltaX > 0) {
-          // Swipe RIGHT = Previous photo
-          currentMediaIndex--;
-          if (currentMediaIndex < 0)
-            currentMediaIndex = mediaFiles.size() - 1;
-        } else {
-          // Swipe LEFT = Next photo
-          currentMediaIndex++;
-          if (currentMediaIndex >= (int)mediaFiles.size())
-            currentMediaIndex = 0;
-        }
-
-        // Show the photo/gif
-        isSlideshow = false;
-        isShowingClock = false;
-        String f = mediaFiles[currentMediaIndex];
-        currentFile = f;
-
-        if (f.endsWith(".vid")) {
-          tft.fillScreen(TFT_BLACK);
-          saveDeviceState();
-        } else if (f.endsWith(".jpg") || f.endsWith(".jpeg")) {
-          tft.fillScreen(TFT_BLACK);
-          tft.setSwapBytes(true);
-          TJpgDec.drawSdJpg(0, 0, f);
-          saveDeviceState();
-        }
+        tft.fillScreen(TFT_BLACK);
       }
     }
-    // Touch zones (corners)
-    else if (touchDuration < LONG_PRESS_TIME) {
-      Serial.printf(">>> TAP detected at (%d, %d) - checking zones\n",
-                    lastTouchX, lastTouchY);
-
-      int screenWidth = tft.width();
-      int screenHeight = tft.height();
-      int cornerZone = screenWidth / 5;      // Left/right 20% zones
-      int bottomZone = screenHeight * 2 / 3; // Bottom 33% zone starts here
-      int topZone = screenHeight / 3;        // Top 33% zone
-
-      // Left corner = Show clock
-      if (lastTouchX < cornerZone && lastTouchY > bottomZone) {
-        Serial.println(">>> LEFT CORNER - showing clock");
-        if (currentFile.endsWith(".vid") || currentFile.endsWith(".mjpeg")) {
-          currentFile = "";
-        }
-        isShowingClock = true;
-        isSlideshow = false;
-        isClockOnlyMode = clockOnlyScreen;
-        clockStartTime = millis();
-        photosSinceLastClock = 0;
-        forceClockRedraw();
-        saveDeviceState();
-      }
-      // Right corner = Toggle slideshow
-      else if (lastTouchX > (screenWidth - cornerZone) &&
-               lastTouchY > bottomZone) {
-        Serial.println(">>> RIGHT CORNER - toggling slideshow");
-        if (mediaFiles.empty()) {
-          loadOrder(currentOrientation);
-        }
-
-        if (!mediaFiles.empty()) {
-          isSlideshow = !isSlideshow;
-          isShowingClock = false;
-          isClockOnlyMode = false;
-
-          if (isSlideshow) {
-            lastSlideTime = millis() - slideInterval;
-            photosSinceLastClock = 0;
-          }
-
-          saveDeviceState();
-          Serial.printf("Slideshow: %s\n", isSlideshow ? "ON" : "OFF");
-        }
-      }
-      // Center tap = Pause/Resume slideshow
-      else if (lastTouchX > cornerZone &&
-               lastTouchX < (screenWidth - cornerZone) &&
-               lastTouchY > topZone && lastTouchY < bottomZone) {
-        Serial.printf(
-            ">>> CENTER TAP - current state: slideshow=%d, clock=%d\n",
-            isSlideshow, isShowingClock);
-        if (isSlideshow) {
-          isSlideshow = false;
-          Serial.println(">>> Slideshow PAUSED");
-        } else if (!isShowingClock && !currentFile.endsWith(".vid") &&
-                   !currentFile.endsWith(".mjpeg")) {
-          isSlideshow = true;
-          lastSlideTime = millis() - slideInterval;
-          Serial.println(">>> Slideshow RESUMED");
-        }
-        saveDeviceState();
-      }
-    }
-
-    delay(DEBOUNCE_TIME);
+    return; // Do not process any other touches while IP is displayed
   }
 
-  // Touch holding (long press detection)
-  else if (touching && isTouching && !longPressHandled) {
+  // Track touch state
+  if (touching && !isTouching) {
+    isTouching = true;
+    touchStartTime = millis();
+    longPressHandled = false;
+  } else if (!touching && isTouching) {
+    isTouching = false;
+    longPressHandled = false;
+  } else if (touching && isTouching && !longPressHandled) {
     unsigned long touchDuration = millis() - touchStartTime;
 
-    if (touchDuration > LONG_PRESS_TIME) {
+    if (touchDuration >= 5000) {
       longPressHandled = true;
-      Serial.println(">>> LONG PRESS detected!");
+      ipDisplayActive = true;
+      ipDisplayStart = millis();
 
-      // If playing a GIF (.vid or .mjpeg file), exit to slideshow
-      if (!currentFile.isEmpty() &&
-          (currentFile.endsWith(".vid") || currentFile.endsWith(".mjpeg"))) {
-        Serial.println(">>> Long press during GIF - returning to slideshow");
-        currentFile = "";
-        isSlideshow = true;
-        isShowingClock = false;
-        lastSlideTime = millis() - slideInterval;
-        photosSinceLastClock = 0;
-        saveDeviceState();
-      }
-      // Long press on TOP area = Show WiFi QR
-      else if (touchStartY < 100) {
-        Serial.println(">>> Long press on top - showing WiFi QR");
-        showWiFiQROverlay();
-      }
-      // Long press on CENTER/BOTTOM = Enter GIF preview mode
-      else {
-        Serial.println(">>> Long press - entering GIF preview mode");
-        enterGifPreviewMode();
-      }
+      Serial.println("[TOUCH] 5s press - showing IP address");
 
-      delay(DEBOUNCE_TIME);
+      tft.fillScreen(TFT_BLACK);
+
+      String ipAddr = WiFi.localIP().toString();
+      if (isAPMode || ipAddr == "0.0.0.0") {
+        ipAddr = "192.168.4.1";
+      }
+      String fullUrl = "http://" + ipAddr;
+
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.setTextDatum(MC_DATUM);
+      tft.drawString("WEB MANAGER", tft.width() / 2, 50, 4);
+
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString("Type this in your browser:", tft.width() / 2, 100, 2);
+
+      // Big green URL - the raw IP that Sir can always use
+      tft.setTextColor(TFT_GREEN, TFT_BLACK);
+      tft.drawString(fullUrl.c_str(), tft.width() / 2, 155, 4);
+
+      tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+      tft.drawString("- OR -", tft.width() / 2, 200, 2);
+      tft.drawString("http://chronosync.local", tft.width() / 2, 230, 2);
+
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString("(touch to dismiss)", tft.width() / 2, 290, 2);
+
+
+    } else if (touchDuration > 1000) {
+      // Countdown feedback for discoverability
+      int remaining = 5 - (touchDuration / 1000);
+      tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+      tft.setTextDatum(BC_DATUM);
+      char buf[32];
+      sprintf(buf, "Hold for IP: %ds", remaining);
+      tft.drawString(buf, tft.width() / 2, tft.height() - 20, 2);
     }
   }
 }
@@ -3075,10 +2805,10 @@ void playRawVideo(String filename, bool infiniteLoop) {
       totalRead += bytesRead;
     }
 
-    // Only check web server periodically (not every frame) for better FPS
-    if (millis() - lastWebCheck > WEB_CHECK_INTERVAL) {
+    // High-priority web server polling during media playback
+    if (millis() - lastWebCheck > 200) { 
       server.handleClient();
-      // Don't call handleTouch() here - it uses SPI and conflicts with video
+      ArduinoOTA.handle(); // Crucial for OTA recovery if UI is stuck
       lastWebCheck = millis();
       if (!isSlideshow && currentFile != filename)
         keepPlaying = false;
@@ -3160,14 +2890,19 @@ void playMJPEG(String filename, bool infiniteLoop) {
       wasTouching = false;
     }
 
-    if (millis() - lastWebCheck > WEB_CHECK_INTERVAL) {
-      server.handleClient();
+    // High-priority web server polling during media playback
+    // MUST execute every frame so chunked index.html data doesn't stall the browser
+    server.handleClient();
+    ArduinoOTA.handle();
+
+    if (millis() - lastWebCheck > 200) {
       lastWebCheck = millis();
       if (!isSlideshow && currentFile != filename)
         keepPlaying = false;
     }
   }
 
+  tft.setSwapBytes(false); // Restore
   free(jpegBuffer);
   mjpegFile.close();
 }
@@ -3225,11 +2960,90 @@ void showSlideshow() {
   }
 }
 
-void showClock() {
-  tft.fillScreen(TFT_WHITE);
-  tft.setSwapBytes(false); // Text mode
+void drawPlainDigit(int x, int y, char digit, bool isDarkTheme, float scale) {
+  uint16_t digitColor = isDarkTheme ? TFT_WHITE : TFT_BLACK;
+  uint16_t bgColor = isDarkTheme ? TFT_BLACK : TFT_WHITE;
+  
+  tft.setSwapBytes(true);
+  drawMontDigitGlyph(x, y, digit, digitColor, bgColor, scale);
+  tft.setSwapBytes(false);
+  yield();
+}
 
-  updateClock(); // Draw initial clock display
+void drawFlipCard(int x, int y, int w, int h, char digit, bool isDarkTheme,
+                  float scale) {
+  // Dark: dark charcoal card on black background
+  // Light: light grey card on white background
+  uint16_t cardColor = isDarkTheme ? 0x2945 : 0xD6BA;
+  uint16_t digitColor = isDarkTheme ? TFT_WHITE : TFT_BLACK;
+  uint16_t bgColor = isDarkTheme ? TFT_BLACK : TFT_WHITE;
+
+  // Draw rounded card background
+  tft.fillRoundRect(x, y, w, h, 8, cardColor);
+
+  // Calculate digit dimensions for centering
+  int digitW = 0;
+  const char *f = strchr(MontserratBoldClock56Chars, digit);
+  if (f) {
+    digitW =
+        (int)(pgm_read_byte(
+                  &MontserratBoldClock56Width[f - MontserratBoldClock56Chars]) *
+              scale);
+  }
+
+  int digitX = x + (w - digitW) / 2;
+  int digitY = y + (h - (int)(56 * scale)) / 2 + 1;
+
+  tft.setSwapBytes(true);
+  drawMontDigitGlyph(digitX, digitY, digit, digitColor, cardColor, scale);
+  tft.setSwapBytes(false);
+
+  // Draw horizontal split line
+  uint16_t lineColor = isDarkTheme ? 0x0841 : TFT_WHITE;
+  tft.drawFastHLine(x, y + h / 2 - 1, w, lineColor);
+  tft.drawFastHLine(x, y + h / 2, w, lineColor);
+
+  // Feed WDT — critical when scale is large (each card draws ~7000 pushImage
+  // rows)
+  yield();
+}
+
+void drawFlipClockString(int x, int y, const char *str, bool isDarkTheme,
+                         float scale, int cardW, int cardH, int spacing) {
+  uint16_t mainBgColor = isDarkTheme ? TFT_BLACK : TFT_WHITE;
+  uint16_t digitColor = isDarkTheme ? TFT_WHITE : TFT_BLACK;
+  int curX = x;
+
+  for (const char *p = str; *p; ++p) {
+    if (*p == ':') {
+      int colonW = 0;
+      const char *f = strchr(MontserratBoldClock56Chars, ':');
+      if (f)
+        colonW =
+            (int)(pgm_read_byte(
+                      &MontserratBoldClock56Width[f -
+                                                  MontserratBoldClock56Chars]) *
+                  scale);
+
+      int colonY = y + (cardH - (int)(56 * scale)) / 2 + 1;
+      tft.setSwapBytes(true);
+      drawMontDigitGlyph(curX, colonY, ':', digitColor, mainBgColor, scale);
+      tft.setSwapBytes(false);
+      curX += colonW + spacing;
+    } else if (*p >= '0' && *p <= '9') {
+      drawFlipCard(curX, y, cardW, cardH, *p, isDarkTheme, scale);
+      curX += cardW + spacing;
+    } else {
+      curX += spacing;
+    }
+  }
+}
+
+void showClock() {
+  uint16_t bgColor = (clockTheme == "light") ? TFT_WHITE : TFT_BLACK;
+  tft.fillScreen(bgColor);
+  tft.setSwapBytes(false); // Text mode
+  updateClock(true);
 }
 
 // Force clock redraw (resets static tracking variables)
@@ -3240,10 +3054,9 @@ void forceClockRedraw() {
   } else {
     tft.setRotation(1); // Landscape
   }
-  // Clear the entire clock area to prevent glitches
-  tft.fillScreen(TFT_WHITE);
+  uint16_t bgColor = (clockTheme == "light") ? TFT_WHITE : TFT_BLACK;
+  tft.fillScreen(bgColor);
   tft.setSwapBytes(false); // Text mode
-  // Trigger immediate update with force flag to bypass static variable check
   updateClock(true);
 }
 
@@ -3251,7 +3064,6 @@ void forceClockRedraw() {
 void updateClock(bool forceRedraw) {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
-    // No time sync - show error (only clear time area, not full screen)
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(TFT_BLACK, TFT_WHITE);
     tft.setTextSize(2);
@@ -3259,310 +3071,114 @@ void updateClock(bool forceRedraw) {
     int centerY = tft.height() / 2;
     tft.fillRect(0, centerY - 30, tft.width(), 60, TFT_WHITE);
     tft.drawString("--:--", centerX, centerY, 4);
-    tft.setTextSize(1);
-    tft.drawString("No Time Sync", centerX, centerY + 40, 2);
     return;
   }
 
-  // Draw time in 12-hour or 24-hour format (HH:MM only, no seconds)
-  char timeStr[12];
+  // Capture time components
+  char hoursStr[3], minsStr[3], secsStr[3], ampmStr[3] = "";
   if (use24Hour) {
-    strftime(timeStr, sizeof(timeStr), "%H:%M",
-             &timeinfo); // 24-hour format, no seconds
+    strftime(hoursStr, sizeof(hoursStr), "%H", &timeinfo);
   } else {
-    strftime(timeStr, sizeof(timeStr), "%I:%M",
-             &timeinfo); // 12-hour format, no seconds
-  }
-
-  // Get AM/PM (only for 12-hour format)
-  char ampmStr[3] = "";
-  if (!use24Hour) {
+    strftime(hoursStr, sizeof(hoursStr), "%I", &timeinfo);
     strftime(ampmStr, sizeof(ampmStr), "%p", &timeinfo);
   }
+  strftime(minsStr, sizeof(minsStr), "%M", &timeinfo);
+  strftime(secsStr, sizeof(secsStr), "%S", &timeinfo);
 
-  // Track previous time to avoid redrawing when minute hasn't changed
-  static String prevTimeStr = "";
-  static String prevAmpmStr = "";
-  static bool prevUse24Hour = use24Hour;
+  // Static tracking
+  static int prevMin = -1;
+  static int prevSec = -1;
   static int prevWidth = 0;
+  static bool prevMode = use24Hour;
 
-  String currentTimeStr = String(timeStr);
-  String currentAmpmStr = String(ampmStr);
-  int currentWidth = tft.width();
+  bool minChanged = (timeinfo.tm_min != prevMin || tft.width() != prevWidth || use24Hour != prevMode || forceRedraw);
+  bool secChanged = (timeinfo.tm_sec != prevSec || minChanged);
 
-  // Only redraw if time changed or format changed (unless forced)
-  if (!forceRedraw && currentTimeStr == prevTimeStr &&
-      currentAmpmStr == prevAmpmStr && prevUse24Hour == use24Hour &&
-      prevWidth == currentWidth) {
-    return; // No change, skip redraw to prevent blinking
+  if (!secChanged) return; // Nothing to update
+
+  bool isDark = (clockTheme == "dark");
+  uint16_t mainBgColor = isDark ? TFT_BLACK : TFT_WHITE;
+  uint16_t textColor = isDark ? TFT_WHITE : TFT_BLACK;
+  uint16_t accentColor = isDark ? 0xDEFB : 0x2104;
+
+  int screenW = tft.width();
+  int screenH = tft.height();
+
+  // Full Redraw or Minute Change
+  if (forceRedraw || minChanged) {
+    tft.fillScreen(mainBgColor);
+    prevMin = timeinfo.tm_min;
+    prevWidth = screenW;
+    prevMode = use24Hour; // Corrected from use24H
+
+    if (screenW == 320) {
+      // === PORTRAIT LAYOUT v4.0 — TFT Font 7 (crisp, no scaling) ===
+      int screenCenterX = screenW / 2;
+
+      // AM/PM top-left, Date top-right
+      tft.setTextDatum(TL_DATUM);
+      tft.setTextColor(accentColor, mainBgColor);
+      if (!use24Hour) tft.drawString(ampmStr, 12, 18, 2);
+
+      tft.setTextDatum(TR_DATUM);
+      char dateStr[64]; strftime(dateStr, sizeof(dateStr), "%a %b %d", &timeinfo);
+      tft.drawString(dateStr, screenW - 12, 18, 2);
+
+      // HH — font 7 (48px crisp 7-segment digits) centered
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(isDark ? TFT_WHITE : TFT_BLACK, mainBgColor);
+      float clockScale = 2.0;
+      int hhW = getMontStringWidth(hoursStr, 4, clockScale);
+      drawMontDigitString(screenCenterX - hhW/2, screenH / 2 - 120, hoursStr, 4, textColor, mainBgColor, clockScale);
+      
+      int mmW = getMontStringWidth(minsStr, 4, clockScale);
+      drawMontDigitString(screenCenterX - mmW/2, screenH / 2 + 10, minsStr, 4, textColor, mainBgColor, clockScale);
+
+      // Timezone footer
+      tft.setTextDatum(BC_DATUM);
+      tft.setTextColor(accentColor, mainBgColor);
+      tft.drawString(timezoneName, screenCenterX, screenH - 14, 2);
+
+    } else {
+      // === LANDSCAPE LAYOUT v4.0 — TFT Font 8 (75px crisp, zero WDT risk) ===
+      int screenCenterX = screenW / 2;
+      int screenCenterY = screenH / 2;
+
+      tft.setTextColor(isDark ? TFT_WHITE : TFT_BLACK, mainBgColor);
+
+      // HOURS left-center, MINS right-center — font 8 is 75px, native 7-seg
+      float clockScale = 1.8;
+      int hhW = getMontStringWidth(hoursStr, 4, clockScale);
+      drawMontDigitString(screenCenterX - hhW - 25, screenCenterY - 60, hoursStr, 4, textColor, mainBgColor, clockScale);
+
+      int mmW = getMontStringWidth(minsStr, 4, clockScale);
+      drawMontDigitString(screenCenterX + 25, screenCenterY - 60, minsStr, 4, textColor, mainBgColor, clockScale);
+
+      // Colon separator
+      int colonW = getMontStringWidth(":", 0, clockScale);
+      drawMontDigitString(screenCenterX - colonW/2, screenCenterY - 60, ":", 0, accentColor, mainBgColor, clockScale);
+
+      // Footer: Date left | AM/PM center | Timezone right
+      char dateStr[64]; strftime(dateStr, sizeof(dateStr), "%A, %B %d, %Y", &timeinfo);
+      tft.setTextDatum(BL_DATUM);
+      tft.setTextColor(textColor, mainBgColor);
+      tft.drawString(dateStr, 14, screenH - 10, 2);
+
+      tft.setTextDatum(BC_DATUM);
+      if (!use24Hour) {
+        tft.setTextColor(accentColor, mainBgColor);
+        tft.drawString(ampmStr, screenCenterX, screenH - 10, 4);
+      }
+
+      tft.setTextDatum(BR_DATUM);
+      tft.setTextColor(accentColor, mainBgColor);
+      tft.drawString(timezoneName, screenW - 14, screenH - 10, 2);
+    }
   }
 
-  // Update previous values
-  prevTimeStr = currentTimeStr;
-  prevAmpmStr = currentAmpmStr;
-  prevUse24Hour = use24Hour;
-  prevWidth = currentWidth;
-
-  if (tft.width() == 320) {
-    // PORTRAIT LAYOUT: Vertical stacking with centered time, AM/PM next to
-    // minutes Split time into hours and minutes
-    char hoursStr[3], minsStr[3];
-    hoursStr[0] = timeStr[0];
-    hoursStr[1] = timeStr[1];
-    hoursStr[2] = '\0';
-    minsStr[0] = timeStr[3];
-    minsStr[1] = timeStr[4];
-    minsStr[2] = '\0';
-
-    float timeScale = 1.5; // Larger time digits
-    float ampmScale = 0.7; // Smaller AM/PM
-    const int spacing = 6;
-
-    // Calculate hours width
-    int hoursW = 0;
-    for (const char *p = hoursStr; *p; ++p) {
-      const char *f = strchr(MontserratBoldClock56Chars, *p);
-      if (f) {
-        hoursW +=
-            (int)(pgm_read_byte(
-                      &MontserratBoldClock56Width[f -
-                                                  MontserratBoldClock56Chars]) *
-                  timeScale) +
-            (int)(spacing * timeScale);
-      }
-    }
-
-    // Calculate minutes width
-    int minsW = 0;
-    for (const char *p = minsStr; *p; ++p) {
-      const char *f = strchr(MontserratBoldClock56Chars, *p);
-      if (f) {
-        minsW +=
-            (int)(pgm_read_byte(
-                      &MontserratBoldClock56Width[f -
-                                                  MontserratBoldClock56Chars]) *
-                  timeScale) +
-            (int)(spacing * timeScale);
-      }
-    }
-
-    // Calculate AM/PM width with smaller scale
-    int ampmW = 0;
-    if (!use24Hour) {
-      for (const char *p = ampmStr; *p; ++p) {
-        const char *f = strchr(MontserratBoldAMPMChars, *p);
-        if (f) {
-          ampmW +=
-              (int)(pgm_read_byte(
-                        &MontserratBoldAMPMWidth[f - MontserratBoldAMPMChars]) *
-                    ampmScale) +
-              2;
-        }
-      }
-    }
-
-    // Portrait layout positions (320x480 screen)
-    // In 12-hour mode, shift everything 10px left to balance AM/PM visual
-    // weight In 24-hour mode, use centered alignment
-    int leftShift =
-        use24Hour ? 23 : 33; // 24hr: 23px left, 12hr: 33px left (10px more)
-    int leftMargin = (tft.width() - hoursW) / 2 - leftShift;
-    int hoursX = leftMargin;
-    int hoursY = 105; // Moved up 10px more (was 115)
-
-    // Align minutes with hours, add more spacing between hour and min
-    int minsX = leftMargin;
-    int minsY = 220; // Increased spacing from hours (was 210)
-
-    // Position AM/PM to the right of minutes with spacing
-    int ampmSpacing = 12; // Space between minutes and AM/PM
-    int ampmX = minsX + minsW + ampmSpacing;
-    int ampmY =
-        minsY +
-        (int)(50 * timeScale); // Adjust vertical position for scaled AM/PM
-
-    // Calculate date position with more spacing from minutes
-    int dateY = minsY + (int)(65 * timeScale) +
-                25; // Increased spacing (was 12px) below minutes
-
-    // Clear time area
-    tft.fillRect(0, hoursY - 10, tft.width(), 240, TFT_WHITE);
-
-    // Draw hours (left-aligned, larger)
-    tft.setSwapBytes(true);
-    drawMontDigitString(hoursX, hoursY, hoursStr, spacing, TFT_BLACK, TFT_WHITE,
-                        timeScale);
-
-    // Draw minutes (aligned with hours, larger)
-    drawMontDigitString(minsX, minsY, minsStr, spacing, TFT_BLACK, TFT_WHITE,
-                        timeScale);
-
-    // Draw AM/PM to the right of minutes (smaller)
-    if (!use24Hour) {
-      drawAMPMString(ampmX, ampmY, ampmStr, 2, TFT_BLACK, TFT_WHITE, ampmScale);
-    }
-    tft.setSwapBytes(false);
-
-    // Draw date: Mon, Dec 08, 2025 (12px spacing from minutes)
-    char dateStr[40];
-    strftime(dateStr, sizeof(dateStr), "%a, %b %d, %Y", &timeinfo);
-    tft.setTextDatum(TC_DATUM);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
-    tft.setTextSize(1);
-    tft.drawString(dateStr, tft.width() / 2, dateY, 4);
-
-    // Draw timezone at bottom
-    tft.drawString(timezoneName, tft.width() / 2, tft.height() - 60, 4);
-
-    // Draw IP address in top right corner (small black text)
-    String ipAddr = WiFi.localIP().toString();
-    tft.setTextDatum(TR_DATUM);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
-    tft.setTextSize(1);
-    tft.drawString(ipAddr, tft.width() - 10, 10, 2);
-
-    // Draw motivational message in top left corner (small black text) - same as
-    // slideshow bar
-    String currentMessage;
-    if (!customMessages.isEmpty() &&
-        customMessages != "Creating memories...\\nLife is beautiful!\\nEnjoy "
-                          "the moments!\\nYou're amazing!\\nNever give up!") {
-      // Parse custom messages for clock display
-      std::vector<String> clockMessages;
-      String temp = customMessages;
-      temp.replace("\\n", "\n");
-      int start = 0;
-      int end = temp.indexOf('\n');
-      while (end != -1) {
-        clockMessages.push_back(temp.substring(start, end));
-        start = end + 1;
-        end = temp.indexOf('\n', start);
-      }
-      if (start < temp.length()) {
-        clockMessages.push_back(temp.substring(start));
-      }
-      if (!clockMessages.empty()) {
-        int msgIndex = (millis() / 5000) % clockMessages.size();
-        currentMessage = clockMessages[msgIndex];
-      } else {
-        currentMessage =
-            encouragementMessages[(millis() / 5000) % messageCount];
-      }
-    } else {
-      currentMessage = encouragementMessages[(millis() / 5000) % messageCount];
-    }
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString(currentMessage, 10, 10, 2);
-
-  } else {
-    // LANDSCAPE LAYOUT: Original horizontal layout with larger size and more
-    // spacing Calculate width for centering (larger scale)
-    float timeScale = 1.2; // Increased from 1.0 for larger digits
-    int totalW = 0;
-    const int spacing =
-        12; // Increased spacing between digits and colon (was 6)
-    for (const char *p = timeStr; *p; ++p) {
-      const char *f = strchr(MontserratBoldClock56Chars, *p);
-      if (f) {
-        totalW +=
-            (int)(pgm_read_byte(
-                      &MontserratBoldClock56Width[f -
-                                                  MontserratBoldClock56Chars]) *
-                  timeScale) +
-            (int)(spacing * timeScale);
-      }
-    }
-
-    // Add AM/PM width to total (smaller 40pt font)
-    int ampmW = 0;
-    if (!use24Hour) {
-      for (const char *p = ampmStr; *p; ++p) {
-        const char *f = strchr(MontserratBoldAMPMChars, *p);
-        if (f) {
-          ampmW +=
-              (int)(pgm_read_byte(
-                        &MontserratBoldAMPMWidth[f - MontserratBoldAMPMChars]) *
-                    timeScale) +
-              2;
-        }
-      }
-    }
-
-    // Center entire time + AM/PM together
-    int combinedW = totalW + (use24Hour ? 0 : 10 + ampmW);
-    int timeX = (tft.width() - combinedW) / 2;
-    int timeY = 90; // Moved up slightly for larger text
-
-    // Clear time area before redrawing (larger area for bigger font)
-    tft.fillRect(0, timeY - 10, tft.width(), 110, TFT_WHITE);
-
-    // Draw time with anti-aliased Montserrat bitmaps (large scaled font)
-    tft.setSwapBytes(true); // Image mode for bitmaps
-    drawMontDigitString(timeX, timeY, timeStr, spacing, TFT_BLACK, TFT_WHITE,
-                        timeScale);
-
-    // Draw AM/PM with smaller bitmap font (only in 12-hour mode)
-    if (!use24Hour) {
-      // Position AM/PM slightly lower to align with time baseline
-      drawAMPMString(timeX + totalW + 10, timeY + 45, ampmStr, 2, TFT_BLACK,
-                     TFT_WHITE, timeScale);
-    }
-    tft.setSwapBytes(false); // Back to text mode
-
-    // Draw date with year (black, centered)
-    char dateStr[40];
-    strftime(dateStr, sizeof(dateStr), "%A, %B %d, %Y", &timeinfo);
-    tft.setTextDatum(TC_DATUM);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
-    tft.setTextSize(1);
-    tft.drawString(dateStr, tft.width() / 2, 210,
-                   4); // Adjusted position for larger time
-
-    // Draw timezone at bottom (black, centered) - increased font size
-    tft.setTextSize(1);
-    tft.drawString(timezoneName, tft.width() / 2, tft.height() - 40,
-                   4); // Changed from font 2 to font 4
-
-    // Draw IP address in top right corner (small black text)
-    String ipAddr = WiFi.localIP().toString();
-    tft.setTextDatum(TR_DATUM);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
-    tft.setTextSize(1);
-    tft.drawString(ipAddr, tft.width() - 10, 10, 2);
-
-    // Draw motivational message in top left corner (small black text) - same as
-    // slideshow bar
-    String currentMessage;
-    if (!customMessages.isEmpty() &&
-        customMessages != "Creating memories...\\nLife is beautiful!\\nEnjoy "
-                          "the moments!\\nYou're amazing!\\nNever give up!") {
-      // Parse custom messages for clock display
-      std::vector<String> clockMessages;
-      String temp = customMessages;
-      temp.replace("\\n", "\n");
-      int start = 0;
-      int end = temp.indexOf('\n');
-      while (end != -1) {
-        clockMessages.push_back(temp.substring(start, end));
-        start = end + 1;
-        end = temp.indexOf('\n', start);
-      }
-      if (start < temp.length()) {
-        clockMessages.push_back(temp.substring(start));
-      }
-      if (!clockMessages.empty()) {
-        int msgIndex = (millis() / 5000) % clockMessages.size();
-        currentMessage = clockMessages[msgIndex];
-      } else {
-        currentMessage =
-            encouragementMessages[(millis() / 5000) % messageCount];
-      }
-    } else {
-      currentMessage = encouragementMessages[(millis() / 5000) % messageCount];
-    }
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString(currentMessage, 10, 10, 2);
-  }
+  // The original update SECONDS block is removed as per instruction.
+  // prevSec = timeinfo.tm_sec; // No longer needed as seconds are not tracked for redraw
+  yield();
 }
 
 // === INDUSTRIAL STABILITY FUNCTIONS ===
